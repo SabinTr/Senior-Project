@@ -11,9 +11,9 @@ back to waiting for the next voice note.
   ignored (the bot tells you the voice wasn't recognized).
 - Typed text messages are not accepted as commands.
 
-Speaker verification uses SpeechBrain's ECAPA model (already installed on
-the robot). The model (~80 MB) is downloaded once into this script's folder
-(pretrained_models/ and hf_cache/), so deleting this folder removes it.
+Speaker verification uses SpeechBrain's ECAPA model. It is already in the
+robot's shared Hugging Face cache (~/.cache/huggingface), so nothing is
+downloaded; pretrained_models/ in this folder only holds small links to it.
 
 --------------------------------------------------------------------
 SETUP (on the Pi)
@@ -46,8 +46,6 @@ import speech_recognition as sr
 from scipy.io import wavfile
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-# Keep the downloaded SpeechBrain model inside this folder (not ~/.cache)
-os.environ.setdefault("HF_HOME", os.path.join(SCRIPT_DIR, "hf_cache"))
 
 # --- Pi resource limiting ---------------------------------------------------
 os.environ.setdefault("OMP_NUM_THREADS", "3")
@@ -209,7 +207,7 @@ def load_voiceprints(encoder, force_rebuild=False):
 
 
 def load_speaker_encoder():
-    print("Loading speaker model (first run downloads ~80 MB)...")
+    print("Loading speaker model...")
     return EncoderClassifier.from_hparams(source=SPEAKER_MODEL, savedir=SPEAKER_MODEL_DIR,
                                           run_opts={"device": "cpu"})
 
