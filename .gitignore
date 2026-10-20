@@ -1,0 +1,19 @@
+# Voice recordings and voiceprints (biometric data - keep off GitHub)
+voice_samples/
+*.wav
+*.oga
+my_voiceprint.npy
+
+# Downloaded models / caches
+pretrained_models/
+hf_cache/
+*.pt
+
+# Local Python environment
+yolo_env/
+__pycache__/
+
+# Robot run outputs
+learned_turn.txt
+lines.jpg
+no_lines_*.jpg
