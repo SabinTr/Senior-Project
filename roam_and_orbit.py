@@ -139,8 +139,9 @@ JOINT_CONTRAST = 20       # how much darker than the floor around it a joint mus
 LINE_IGNORE_TOP = 0.1     # ignore this top part of the picture (joints across the path are
                           # often near the top, so don't cut more)
 LINE_MIN_TOTAL_PX = 150   # need at least this much line length to trust the angle
-STEER_GAIN = 0.005        # steering per degree of tilt while driving (higher = wobbles)
-STEER_MAX = 0.1           # max steering correction (these values were confirmed to work)
+STEER_GAIN = 0.008        # steering per degree of tilt while driving (higher = wobbles)
+STEER_MAX = 0.12          # max steering correction (0.005 / 0.1 worked but still let it
+                          # drift slowly over full lanes, 2026-10-21)
 FINISH_RATE_START = 0.26  # finishing a turn: start turning this gently...
 FINISH_RATE_MIN = 0.12    # ...never weaker than this after going past straight
 FINISH_TOLERANCE_DEG = 2.5  # picture tilt counted as straight
