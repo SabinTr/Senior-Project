@@ -75,6 +75,7 @@ STEER_TRIM = -0.01       # 0 curved right; -0.03 a lot left; -0.02 slightly left
 # --- CALIBRATION: measure these on the floor after --test --------------------
 FORWARD_CM_PER_SEC = 28   # distance driven forward in 1 s at DRIVE_SPEED
 DRIVE_START_SECONDS = 0.4 # extra time a short drive needs to get up to speed
+                          # (these are the values --uturn was confirmed "PERFECT" with)
                           # (lane 1: ~1.6 m in ~5.7 s; 15 made the U-turn step ~1 tile)
 STRAFE_CM_PER_SEC = 12    # distance slid sideways in 1 s at DRIVE_SPEED
 # The robot needs a moment to get going before it really turns. From real results
@@ -726,6 +727,28 @@ def calib90_test(robot):
     print(f"Saved: TURN_START_DELAY = {TURN_START_DELAY:.2f} s - all turns use this now.")
 
 
+def simple_sweep(robot):
+    """ONLY the two parts the user confirmed, put together:
+    - straight driving exactly like --straight ("perfect"), until the sensor sees the wall
+      (two readings in a row closer than DETECT_CM)
+    - the U-turn exactly like --uturn ("PERFECT"): next_lane()
+    Lane 1, U-turn left, lane 2, U-turn right, ... until a U-turn finds the side wall."""
+    if robot.tiles is not None:
+        robot.tiles.calibrate_straight()
+    turn_right = False                       # first U-turn is to the LEFT
+    for lane in range(1, MAX_LANES + 1):
+        print(f"Lane {lane}")
+        robot.readings = []                  # fresh steering for every lane, like --straight
+        while not (robot.distance_cm() <= DETECT_CM and robot.distance_cm() <= DETECT_CM):
+            robot.move(forward=DRIVE_SPEED, turn_right=robot.steer())
+        robot.stop()
+        print("  wall - U-turn " + ("right" if turn_right else "left"))
+        if not next_lane(robot, turn_right):
+            break
+        turn_right = not turn_right
+    robot.stop()
+
+
 def uturn_test(robot):
     """Only the U-turn: 90 deg left -> 30 cm -> 90 deg left, then stop."""
     input("Robot lined up with the tiles, >= 70 cm free on its LEFT. Press Enter...")
@@ -860,12 +883,19 @@ def main():
         elif "--uturn" in sys.argv:
             load_learned_turns()
             uturn_test(robot)
+        elif "--lane1" in sys.argv:
+            # step 3: lane 1 to the wall + the U-turn, then stop (same code as the full run)
+            global MAX_LANES
+            MAX_LANES = 1
+            load_learned_turns()
+            sweep_room(robot)
+            print("Done: lane 1 + U-turn. It should face back the way it came, one lane over.")
         elif "--lines" in sys.argv:
             lines_test(robot)
         else:
             load_learned_turns()
-            count = sweep_room(robot)
-            print(f"Done. Circled {count} object(s).")
+            simple_sweep(robot)      # only the confirmed straight driving + U-turn
+            print("Done.")
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
