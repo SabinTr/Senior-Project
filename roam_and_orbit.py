@@ -46,6 +46,7 @@ import sys
 import math
 import time
 import signal
+import threading
 import cv2
 import numpy as np
 
@@ -112,6 +113,26 @@ MAX_LANES = 30            # safety limit; normally the sweep ends at the far sid
 # slid right into the wall). So for now everything in front is treated as a wall;
 # objects will be found with the camera later. True = old object check + orbit.
 DETECT_OBJECTS = False
+
+# --- Objects in the way (camera + sensor) -------------------------------------
+# The camera (YOLO) checks the picture while driving: an object in the robot's path that
+# is close (low in the picture) stops the robot even if the low sensor doesn't see it.
+# When the sensor sees something close, the camera decides: object -> stop, else wall.
+# Only TARGET_OBJECT ends the run; anything else in the way is handled like a wall (U-turn).
+USE_CAMERA_OBJECTS = True
+TARGET_OBJECT = "bottle"      # YOLO's name for it; change on the command line: --find cup
+YOLO_MODEL = "yolov8n.pt"     # in the same folder as this script on the robot
+YOLO_IMGSZ = 320              # smaller = faster on the Pi
+YOLO_CONF = 0.30              # how sure YOLO must be (0.45 barely caught a phone; bottle 50-90 %)
+YOLO_EVERY_S = 0.3            # check the camera picture this often while driving
+YOLO_THREADS = 2              # CPU cores YOLO may use, the rest stay free for the steering
+OBJECT_PATH = (0.25, 0.75)    # "in the path" = object's centre in this part of the picture width
+OBJECT_STOP_ROW = 0.95        # "close" = object's bottom edge below this height (0 top, 1 bottom)
+                              # measured with a bottle: ~1 m = 0.84, ~30 cm = 0.98, 20 cm = 0.98-0.99,
+                              # touching = not seen at all (the sensor covers that)
+# Big furniture and people are handled like walls (U-turn), not as objects to find:
+NOT_OBJECTS = {"person", "chair", "couch", "bed", "dining table", "refrigerator", "tv",
+               "oven", "sink", "toilet", "microwave", "bench"}
 MAX_RUN_SECONDS = 15 * 60 # safety limit for the whole run
 
 # The sensor only looks forward, so the robot never slides sideways into the
@@ -239,6 +260,106 @@ class TileHeading:
         self.cap.release()
 
 
+class ObjectSpotter:
+    """YOLO on the camera pictures the tile steering already takes.
+    While driving it runs in the background (start/stop_watching): one YOLO check takes
+    longer on the Pi than a whole steering step, and when it ran inside the driving loop the
+    robot couldn't steer or read the sensor in the meantime - that ruined the lanes."""
+
+    def __init__(self):
+        os.environ.setdefault("OMP_NUM_THREADS", str(YOLO_THREADS))
+        import torch
+        from ultralytics import YOLO                 # slow import: only when objects are on
+        torch.set_num_threads(YOLO_THREADS)
+        print("Loading YOLO...")
+        self.model = YOLO(os.path.join(os.path.dirname(os.path.abspath(__file__)), YOLO_MODEL))
+        # the first check is much slower than the others: do it now, standing still
+        self.model(np.zeros((480, 640, 3), np.uint8), imgsz=YOLO_IMGSZ, verbose=False)
+        self.recent_hits = []        # last 3 checks: was a close object in the path?
+        self.last_close = None
+        self.found = None            # set by the background check: close object in the path
+        self.watching = False
+        self.thread = None
+        self.last_frame = None
+        self.last_result = None
+
+    def in_path(self, frame):
+        """Objects in the robot's path in this picture: list of dicts, closest first."""
+        h, w = frame.shape[:2]
+        result = self.model(frame, imgsz=YOLO_IMGSZ, conf=YOLO_CONF, verbose=False)[0]
+        self.last_frame, self.last_result = frame, result
+        found = []
+        for box in result.boxes:
+            name = self.model.names[int(box.cls[0])]
+            if name in NOT_OBJECTS and name != TARGET_OBJECT:
+                continue
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            if not OBJECT_PATH[0] <= (x1 + x2) / 2 / w <= OBJECT_PATH[1]:
+                continue
+            found.append({"name": name, "conf": float(box.conf[0]), "bottom": y2 / h})
+        return sorted(found, key=lambda o: -o["bottom"])
+
+    def start_watching(self, tiles):
+        """Check the steering camera's pictures in the background while the robot drives."""
+        self.recent_hits, self.last_close, self.found = [], None, None
+        self.watching = True
+        self.thread = threading.Thread(target=self._watch, args=(tiles,), daemon=True)
+        self.thread.start()
+
+    def stop_watching(self):
+        self.watching = False
+        if self.thread is not None:
+            self.thread.join()
+            self.thread = None
+
+    def _watch(self, tiles):
+        """A close object in the path seen in 2 of the last 3 checks -> self.found.
+        (Small things like a phone flicker: seen, not seen, seen - '2 in a row' never fired.)"""
+        close_result = None
+        while self.watching and self.found is None:
+            frame = tiles.last_frame
+            if frame is None:
+                time.sleep(0.05)
+                continue
+            seen = self.in_path(frame)
+            if seen:                                 # report only (changes nothing)
+                print("    camera: " + ", ".join(f"{o['name']} {o['conf']:.0%} bottom {o['bottom']:.2f}"
+                                                 for o in seen))
+            close = [o for o in seen if o["bottom"] >= OBJECT_STOP_ROW]
+            close.sort(key=lambda o: o["name"] != TARGET_OBJECT)   # the target first
+            self.recent_hits = (self.recent_hits + [bool(close)])[-3:]
+            if close:
+                self.last_close, close_result = close[0], self.last_result
+            if sum(self.recent_hits) >= 2:
+                self.found = self.last_close
+                self.last_result = close_result      # photo = a picture that shows it
+            time.sleep(YOLO_EVERY_S)
+
+    def target_ahead(self, robot):
+        """Standing still: the target in the path in one of 2 fresh looks -> (target, None),
+        else (None, the closest other object seen, or None = nothing, i.e. a wall)."""
+        other = None
+        for _ in range(2):
+            time.sleep(0.2)
+            robot.tiles.angle()                      # takes a fresh picture
+            if robot.tiles.last_frame is None:
+                continue
+            found = self.in_path(robot.tiles.last_frame)
+            for o in found:
+                if o["name"] == TARGET_OBJECT:
+                    return o, None
+            if found and other is None:
+                other = found[0]
+        return None, other
+
+    def save_photo(self, name):
+        if self.last_result is None:
+            return None
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+        cv2.imwrite(path, self.last_result.plot())
+        return path
+
+
 class Robot:
     """Small wrapper so the rest of the code doesn't depend on the SDK."""
 
@@ -364,6 +485,7 @@ def drive_forward_cm(robot, cm):
     while time.time() < end:
         if robot.distance_cm() < SAFE_CM:
             robot.stop()
+            print(f"    step cut short: sensor {robot.last_cm:.0f} cm")   # report only
             return False
         robot.move(forward=DRIVE_SPEED, turn_right=robot.steer())
     robot.stop()
@@ -733,21 +855,93 @@ def simple_sweep(robot):
     - straight driving exactly like --straight ("perfect"), until the sensor sees the wall
       (two readings in a row closer than DETECT_CM)
     - the U-turn exactly like --uturn ("PERFECT"): next_lane()
-    Lane 1, U-turn left, lane 2, U-turn right, ... until a U-turn finds the side wall."""
+    Lane 1, U-turn left, lane 2, U-turn right, ... until a U-turn finds the side wall.
+    Only TARGET_OBJECT ends the run; any other object in the way gets a U-turn like a wall."""
     if robot.tiles is not None:
         robot.tiles.calibrate_straight()
+    spotter = None
+    if USE_CAMERA_OBJECTS and robot.tiles is not None:
+        spotter = ObjectSpotter()
+        print(f"Looking for: {TARGET_OBJECT}")
     turn_right = False                       # first U-turn is to the LEFT
     for lane in range(1, MAX_LANES + 1):
         print(f"Lane {lane}")
         robot.readings = []                  # fresh steering for every lane, like --straight
+        if spotter:
+            spotter.start_watching(robot.tiles)  # camera: objects too low for the sensor
+        last_report, pictures, with_lines = time.time(), 0, 0
         while not (robot.distance_cm() <= DETECT_CM and robot.distance_cm() <= DETECT_CM):
-            robot.move(forward=DRIVE_SPEED, turn_right=robot.steer())
+            t = time.time()
+            steering = robot.steer()
+            robot.move(forward=DRIVE_SPEED, turn_right=steering)
+            # report only (changes nothing): what the steering sees, once a second
+            pictures += 1
+            if robot.readings and robot.readings[-1][0] >= t:
+                with_lines += 1
+            if time.time() - last_report >= 1.0:
+                h = "none" if robot.heading is None else f"{robot.heading:+.1f} deg"
+                print(f"    heading {h}, steering {steering:+.3f}, tile lines in "
+                      f"{with_lines}/{pictures} pictures, sensor {robot.last_cm:.0f} cm")
+                last_report, pictures, with_lines = time.time(), 0, 0
+            if spotter and spotter.found:
+                break                        # camera: something close in the path
         robot.stop()
-        print("  wall - U-turn " + ("right" if turn_right else "left"))
+        what = "wall"
+        if spotter:
+            spotter.stop_watching()          # no YOLO during the U-turn: it stays as confirmed
+            seen_by = "camera" if spotter.found else "sensor + camera"
+            if spotter.found and spotter.found["name"] == TARGET_OBJECT:
+                target, other = spotter.found, None
+            else:                            # look again standing still: target or not?
+                target, other = spotter.target_ahead(robot)
+            if target:
+                object_found(spotter, target, seen_by)
+                return
+            other = spotter.found or other
+            if other:
+                what = f"{other['name']} in the way (not a {TARGET_OBJECT})"
+        print(f"  {what} - U-turn " + ("right" if turn_right else "left"))
         if not next_lane(robot, turn_right):
             break
         turn_right = not turn_right
     robot.stop()
+    if spotter:
+        print(f"Whole room swept - no {TARGET_OBJECT} found.")
+
+
+def object_found(spotter, obj, seen_by):
+    """Step 1: just stop and save a photo. What to do next with the object comes later."""
+    photo = spotter.save_photo("object_found.jpg")
+    print(f"OBJECT in front: {obj['name']} ({obj['conf']:.0%} sure, seen by {seen_by}) - stopped.")
+    if photo:
+        print(f"  photo saved: {photo}")
+
+
+def objects_test(robot):
+    """Doesn't move: shows what the camera counts as objects in the path, and which are
+    'close' (would stop the robot). Saves objects_view.jpg."""
+    if robot.tiles is None:
+        print("No camera.")
+        return
+    global YOLO_CONF
+    if "--conf" in sys.argv:              # e.g. --conf 0.2: also show less certain guesses
+        YOLO_CONF = float(sys.argv[sys.argv.index("--conf") + 1])
+    spotter = ObjectSpotter()
+    print(f"Ctrl+C to stop. 'close' = bottom edge below {OBJECT_STOP_ROW:.2f} of the picture, "
+          f"YOLO must be {YOLO_CONF:.0%} sure.")
+    while True:
+        robot.tiles.angle()
+        frame = robot.tiles.last_frame
+        if frame is None:
+            continue
+        found = spotter.in_path(frame)
+        if not found:
+            print("  nothing in the path")
+        for o in found:
+            tag = "CLOSE - would stop" if o["bottom"] >= OBJECT_STOP_ROW else "further away"
+            print(f"  {o['name']} {o['conf']:.0%}, bottom at {o['bottom']:.2f} -> {tag}")
+        spotter.save_photo("objects_view.jpg")
+        time.sleep(0.5)
 
 
 def uturn_test(robot):
@@ -867,6 +1061,9 @@ def main():
 
     signal.signal(signal.SIGHUP, stop_on_signal)
     signal.signal(signal.SIGTERM, stop_on_signal)
+    global TARGET_OBJECT
+    if "--find" in sys.argv:              # e.g. --find cup   or   --find "cell phone"
+        TARGET_OBJECT = sys.argv[sys.argv.index("--find") + 1]
     robot = Robot()
     try:
         if "--test" in sys.argv:
@@ -893,6 +1090,8 @@ def main():
             print("Done: lane 1 + U-turn. It should face back the way it came, one lane over.")
         elif "--lines" in sys.argv:
             lines_test(robot)
+        elif "--objects" in sys.argv:
+            objects_test(robot)
         else:
             load_learned_turns()
             simple_sweep(robot)      # only the confirmed straight driving + U-turn
