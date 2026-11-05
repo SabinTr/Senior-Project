@@ -121,6 +121,13 @@ DETECT_OBJECTS = False
 # Only TARGET_OBJECT ends the run; anything else in the way is handled like a wall (U-turn).
 USE_CAMERA_OBJECTS = True
 TARGET_OBJECT = "bottle"      # YOLO's name for it; change on the command line: --find cup
+# Names YOLO sometimes gives the target instead (the user's bottle was called "cup" and the
+# robot U-turned in front of it). They count as the target too.
+LOOKS_LIKE = {"bottle": {"cup", "vase"}}
+
+
+def is_target(name):
+    return name == TARGET_OBJECT or name in LOOKS_LIKE.get(TARGET_OBJECT, ())
 YOLO_MODEL = "yolov8n.pt"     # in the same folder as this script on the robot
 YOLO_IMGSZ = 320              # smaller = faster on the Pi
 YOLO_CONF = 0.30              # how sure YOLO must be (0.45 barely caught a phone; bottle 50-90 %)
@@ -291,7 +298,7 @@ class ObjectSpotter:
         found = []
         for box in result.boxes:
             name = self.model.names[int(box.cls[0])]
-            if name in NOT_OBJECTS and name != TARGET_OBJECT:
+            if name in NOT_OBJECTS and not is_target(name):
                 continue
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             if not OBJECT_PATH[0] <= (x1 + x2) / 2 / w <= OBJECT_PATH[1]:
@@ -321,12 +328,8 @@ class ObjectSpotter:
             if frame is None:
                 time.sleep(0.05)
                 continue
-            seen = self.in_path(frame)
-            if seen:                                 # report only (changes nothing)
-                print("    camera: " + ", ".join(f"{o['name']} {o['conf']:.0%} bottom {o['bottom']:.2f}"
-                                                 for o in seen))
-            close = [o for o in seen if o["bottom"] >= OBJECT_STOP_ROW]
-            close.sort(key=lambda o: o["name"] != TARGET_OBJECT)   # the target first
+            close = [o for o in self.in_path(frame) if o["bottom"] >= OBJECT_STOP_ROW]
+            close.sort(key=lambda o: not is_target(o["name"]))     # the target first
             self.recent_hits = (self.recent_hits + [bool(close)])[-3:]
             if close:
                 self.last_close, close_result = close[0], self.last_result
@@ -346,7 +349,7 @@ class ObjectSpotter:
                 continue
             found = self.in_path(robot.tiles.last_frame)
             for o in found:
-                if o["name"] == TARGET_OBJECT:
+                if is_target(o["name"]):
                     return o, None
             if found and other is None:
                 other = found[0]
@@ -485,7 +488,6 @@ def drive_forward_cm(robot, cm):
     while time.time() < end:
         if robot.distance_cm() < SAFE_CM:
             robot.stop()
-            print(f"    step cut short: sensor {robot.last_cm:.0f} cm")   # report only
             return False
         robot.move(forward=DRIVE_SPEED, turn_right=robot.steer())
     robot.stop()
@@ -869,20 +871,8 @@ def simple_sweep(robot):
         robot.readings = []                  # fresh steering for every lane, like --straight
         if spotter:
             spotter.start_watching(robot.tiles)  # camera: objects too low for the sensor
-        last_report, pictures, with_lines = time.time(), 0, 0
         while not (robot.distance_cm() <= DETECT_CM and robot.distance_cm() <= DETECT_CM):
-            t = time.time()
-            steering = robot.steer()
-            robot.move(forward=DRIVE_SPEED, turn_right=steering)
-            # report only (changes nothing): what the steering sees, once a second
-            pictures += 1
-            if robot.readings and robot.readings[-1][0] >= t:
-                with_lines += 1
-            if time.time() - last_report >= 1.0:
-                h = "none" if robot.heading is None else f"{robot.heading:+.1f} deg"
-                print(f"    heading {h}, steering {steering:+.3f}, tile lines in "
-                      f"{with_lines}/{pictures} pictures, sensor {robot.last_cm:.0f} cm")
-                last_report, pictures, with_lines = time.time(), 0, 0
+            robot.move(forward=DRIVE_SPEED, turn_right=robot.steer())
             if spotter and spotter.found:
                 break                        # camera: something close in the path
         robot.stop()
@@ -890,7 +880,7 @@ def simple_sweep(robot):
         if spotter:
             spotter.stop_watching()          # no YOLO during the U-turn: it stays as confirmed
             seen_by = "camera" if spotter.found else "sensor + camera"
-            if spotter.found and spotter.found["name"] == TARGET_OBJECT:
+            if spotter.found and is_target(spotter.found["name"]):
                 target, other = spotter.found, None
             else:                            # look again standing still: target or not?
                 target, other = spotter.target_ahead(robot)
@@ -912,7 +902,8 @@ def simple_sweep(robot):
 def object_found(spotter, obj, seen_by):
     """Step 1: just stop and save a photo. What to do next with the object comes later."""
     photo = spotter.save_photo("object_found.jpg")
-    print(f"OBJECT in front: {obj['name']} ({obj['conf']:.0%} sure, seen by {seen_by}) - stopped.")
+    name = obj["name"] if obj["name"] == TARGET_OBJECT else f"{TARGET_OBJECT} (YOLO said {obj['name']})"
+    print(f"OBJECT in front: {name} ({obj['conf']:.0%} sure, seen by {seen_by}) - stopped.")
     if photo:
         print(f"  photo saved: {photo}")
 
