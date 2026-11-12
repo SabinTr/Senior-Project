@@ -255,9 +255,11 @@ def extract_target_object(text):
         return phrase
     if phrase in SYNONYMS:
         return SYNONYMS[phrase]
-    for cls in COCO_CLASSES:
-        if cls in phrase:
-            return cls
+    # the name that comes FIRST in the sentence, on a tie the longer one: "find my teddy bear"
+    # gave "bear" (the animal comes earlier in COCO_CLASSES) and the robot ignored the teddy bear
+    found = [cls for cls in COCO_CLASSES if cls in phrase]
+    if found:
+        return min(found, key=lambda cls: (phrase.find(cls), -len(cls)))
     for word, cls in SYNONYMS.items():
         if word in phrase:
             return cls

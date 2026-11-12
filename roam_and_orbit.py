@@ -45,7 +45,9 @@ import os
 import sys
 import math
 import time
+import pickle
 import signal
+import subprocess
 import threading
 import cv2
 import numpy as np
@@ -273,37 +275,54 @@ class ObjectSpotter:
     """YOLO on the camera pictures the tile steering already takes.
     While driving it runs in the background (start/stop_watching): one YOLO check takes
     longer on the Pi than a whole steering step, and when it ran inside the driving loop the
-    robot couldn't steer or read the sensor in the meantime - that ruined the lanes."""
+    robot couldn't steer or read the sensor in the meantime - that ruined the lanes.
+    YOLO itself runs as its OWN program (yolo_worker.py): inside this program it still bent
+    the lanes (importing ultralytics makes OpenCV single-threaded for the tile steering, and
+    YOLO's work competed with the steering loop); with YOLO off the lanes were perfect."""
 
     def __init__(self):
-        os.environ.setdefault("OMP_NUM_THREADS", str(YOLO_THREADS))
-        import torch
-        from ultralytics import YOLO                 # slow import: only when objects are on
-        torch.set_num_threads(YOLO_THREADS)
+        here = os.path.dirname(os.path.abspath(__file__))
         print("Loading YOLO...")
-        self.model = YOLO(os.path.join(os.path.dirname(os.path.abspath(__file__)), YOLO_MODEL))
-        # the first check is much slower than the others: do it now, standing still
-        self.model(np.zeros((480, 640, 3), np.uint8), imgsz=YOLO_IMGSZ, verbose=False)
+        self.worker = subprocess.Popen(
+            [sys.executable, os.path.join(here, "yolo_worker.py"), os.path.join(here, YOLO_MODEL),
+             str(YOLO_IMGSZ), str(YOLO_CONF), str(YOLO_THREADS)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        try:
+            ready = pickle.load(self.worker.stdout)   # it does the slow first check itself
+        except EOFError:
+            ready = None
+        if ready != "ready":
+            raise RuntimeError("the YOLO program (yolo_worker.py) didn't start - see above")
+        self.lock = threading.Lock()
         self.found = None            # set by the background check: close object in the path
         self.watching = False
         self.thread = None
         self.last_frame = None
-        self.last_result = None
+        self.last_boxes = []
+
+    def _ask(self, frame):
+        """What yolo_worker.py sees in this picture: (name, conf, x1, y1, x2, y2), box as
+        fractions of the picture. Sent at YOLO's own size (it shrinks it to that anyway)."""
+        h, w = frame.shape[:2]
+        scale = YOLO_IMGSZ / max(h, w)
+        if scale < 1:
+            frame = cv2.resize(frame, (round(w * scale), round(h * scale)))
+        with self.lock:
+            pickle.dump(frame, self.worker.stdin)
+            self.worker.stdin.flush()
+            return pickle.load(self.worker.stdout)
 
     def in_path(self, frame):
         """Objects in the robot's path in this picture: list of dicts, closest first."""
-        h, w = frame.shape[:2]
-        result = self.model(frame, imgsz=YOLO_IMGSZ, conf=YOLO_CONF, verbose=False)[0]
-        self.last_frame, self.last_result = frame, result
+        boxes = self._ask(frame)
+        self.last_frame, self.last_boxes = frame, boxes
         found = []
-        for box in result.boxes:
-            name = self.model.names[int(box.cls[0])]
+        for name, conf, x1, y1, x2, y2 in boxes:
             if name in NOT_OBJECTS and not is_target(name):
                 continue
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            if not OBJECT_PATH[0] <= (x1 + x2) / 2 / w <= OBJECT_PATH[1]:
+            if not OBJECT_PATH[0] <= (x1 + x2) / 2 <= OBJECT_PATH[1]:
                 continue
-            found.append({"name": name, "conf": float(box.conf[0]), "bottom": y2 / h})
+            found.append({"name": name, "conf": conf, "bottom": y2})
         return sorted(found, key=lambda o: -o["bottom"])
 
     def start_watching(self, tiles):
@@ -352,10 +371,18 @@ class ObjectSpotter:
         return None, other
 
     def save_photo(self, name):
-        if self.last_result is None:
+        """The last picture YOLO checked, with its boxes drawn in."""
+        if self.last_frame is None:
             return None
+        img = self.last_frame.copy()
+        h, w = img.shape[:2]
+        for label, conf, x1, y1, x2, y2 in self.last_boxes:
+            p1, p2 = (int(x1 * w), int(y1 * h)), (int(x2 * w), int(y2 * h))
+            cv2.rectangle(img, p1, p2, (0, 255, 0), 2)
+            cv2.putText(img, f"{label} {conf:.0%}", (p1[0], max(18, p1[1] - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
-        cv2.imwrite(path, self.last_result.plot())
+        cv2.imwrite(path, img)
         return path
 
 
