@@ -102,7 +102,8 @@ ORBIT_LAPS = 1            # how many times to go around each object
 PROBE_DEG = 35            # how far to turn left/right to test narrow vs wide
 CLEAR_MARGIN_CM = 30      # "sees past it" = reading this much farther than before
 LOST_CM = 80              # while circling, farther than this = object lost
-LANE_WIDTH_CM = 30        # distance between lanes
+LANE_WIDTH_CM = 30        # distance between lanes (side-wall check before the U-turn step)
+LANE_STEP_CM = 35         # how far the U-turn step drives between the 2 turns (30 was too short)
 SIDESTEP_CM = 30          # how far to move past an object after circling it
 SAFE_CM = 20              # never drive closer than this to anything in front
 EARLY_FRACTION = 0.7      # lane 2+: ignore "something in front" before 70% of lane 1's time...
@@ -529,7 +530,7 @@ def next_lane(robot, to_right):
     if robot.distance_cm() < LANE_WIDTH_CM + SAFE_CM:
         print("  side wall reached: room finished")
         return False
-    drive_forward_cm(robot, LANE_WIDTH_CM)
+    drive_forward_cm(robot, LANE_STEP_CM)
     tilt = measure_tilt(robot) or 0.0
     turn(robot, angle - tilt / CAMERA_TILT_FACTOR)
     learn_from_turn(robot, angle)
